@@ -1,22 +1,58 @@
 from argparse import Namespace
 from collections.abc import Callable
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
 
-from miles.utils.misc import load_function
-from miles.utils.ppo_utils import compute_approx_kl, compute_gspo_kl, compute_opsm_mask, compute_policy_loss
-from miles.utils.types import RolloutBatch
-
-from ..cp_utils import (
+from miles.backends.training_utils.cp_utils import (
     all_gather_with_cp,
     get_local_response_loss_masks,
     get_sum_of_sample_mean,
     slice_loss_masks_for_local_cp,
 )
-from ..parallel import get_parallel_state
-from .corrections import vanilla_tis_function
-from .logits import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_function
+from miles.backends.training_utils.loss_hub.logits import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.misc import load_function
+from miles.utils.ppo_utils import compute_approx_kl, compute_gspo_kl, compute_opsm_mask, compute_policy_loss
+from miles.utils.types import RolloutBatch
+
+
+class LossFunction(Protocol):
+    """Common signature of the per-loss-type functions dispatched by `get_loss_function`."""
+
+    def __call__(
+        self,
+        args: Namespace,
+        batch: RolloutBatch,
+        logits: torch.Tensor,
+        sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute a scalar loss with gradient + a dict of detached scalar metrics.
+
+        Args:
+            args: Configuration. Each loss type reads its own subset of flags
+                (PPO eps, KL coefficients, value clip, TIS settings, OPSM, etc.).
+            batch: Mini-batch (`miles.utils.types.RolloutBatch`). Loss-type-
+                dependent keys; common ones are `unconcat_tokens`, `response_lengths`,
+                `total_lengths`, `loss_masks`, optional `max_seq_lens` (required for
+                qkv_format="bshd"). Per-implementation docstrings list extras.
+            logits: Float32. Last dim is vocab_size (policy/sft) or 1 (value).
+                Outer shape is `[1, T, ...]` for qkv_format="thd" (T = sum of
+                total_lengths) or `[B, max_seq_len, ...]` for "bshd".
+            sum_of_sample_mean: CP-aware reducer; takes a flat per-token tensor
+                and returns a scalar, sample-mean-weighted by `loss_masks`.
+
+        Returns:
+            `(loss, metrics)`:
+              * `loss`: scalar tensor with grad, un-rescaled (the dispatcher
+                applies Megatron scaling on top).
+              * `metrics`: dict of detached 0-d scalars; surfaced under `train/`
+                in the training log / wandb. Keys per loss type are documented
+                on each implementation.
+        """
+        ...
 
 
 def compute_ess_ratio_contribution(
@@ -253,7 +289,7 @@ def policy_loss_function(
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
-    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+    if args.custom_pg_loss_reducer_function_path is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
         pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
@@ -479,7 +515,7 @@ def sft_loss_function(
     )
 
 
-def get_loss_function(args) -> Callable:
+def get_loss_function(args: Namespace) -> LossFunction:
     match args.loss_type:
         case "policy_loss":
             return policy_loss_function
