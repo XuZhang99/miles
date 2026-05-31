@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -96,13 +97,13 @@ class RolloutManager:
 
     # -------------------------- data generation -----------------------------
 
-    def generate(self, rollout_id):
+    async def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
         self._health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metadata, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = convert_samples_to_train_data(
@@ -114,17 +115,19 @@ class RolloutManager:
         )
         return split_train_data_by_dp(self.args, data, self.train_parallel_config["dp_size"])
 
-    def eval(self, rollout_id):
+    async def eval(self, rollout_id):
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
         self._health_monitoring_resume()
 
         if self.use_experimental_refactor:
-            result = call_rollout_function(self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id))
+            result = await asyncio.to_thread(
+                call_rollout_function, self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id)
+            )
         else:
-            result = call_rollout_fn(
-                self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True
+            result = await asyncio.to_thread(
+                call_rollout_fn, self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True
             )
         data = result.data
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
@@ -132,17 +135,19 @@ class RolloutManager:
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
 
-    def _get_rollout_data(self, rollout_id):
+    async def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metadata = {}  # save/load metadata into debug rollout data as well
             metrics = None
         else:
             if self.use_experimental_refactor:
-                data = call_rollout_function(self.generate_rollout, RolloutFnTrainInput(rollout_id=rollout_id))
+                data = await asyncio.to_thread(
+                    call_rollout_function, self.generate_rollout, RolloutFnTrainInput(rollout_id=rollout_id)
+                )
             else:
-                data = call_rollout_fn(
-                    self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
+                data = await asyncio.to_thread(
+                    call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
                 )
             metrics = data.metrics
             data = data.samples
@@ -162,7 +167,8 @@ class RolloutManager:
 
     # -------------------------- offload/onload -----------------------------
 
-    def offload(self, tags: list[str] | None = None):
+    # TODO may parallelly execute offload/onload across services
+    async def offload(self, tags: list[str] | None = None):
         self._health_monitoring_pause()
         if tags is not None:
             handles = [
@@ -170,21 +176,21 @@ class RolloutManager:
                 for engine in self._rollout_engines
                 if engine is not None
             ]
-            return ray.get(handles) if handles else []
+            return await asyncio.gather(*handles)
         for srv in self.servers.values():
-            srv.offload()
+            await srv.offload()
 
-    def onload(self, tags: list[str] | None = None):
+    async def onload(self, tags: list[str] | None = None):
         for srv in self.servers.values():
-            srv.onload(tags)
+            await srv.onload(tags)
 
-    def onload_weights(self):
+    async def onload_weights(self):
         for srv in self.servers.values():
-            srv.onload_weights()
+            await srv.onload_weights()
 
-    def onload_kv(self):
+    async def onload_kv(self):
         for srv in self.servers.values():
-            srv.onload_kv()
+            await srv.onload_kv()
 
     # -------------------------- engine management -----------------------------
 
@@ -203,7 +209,7 @@ class RolloutManager:
         if srv:
             srv.clear_num_new_engines()
 
-    def recover_updatable_engines(self) -> None:
+    async def recover_updatable_engines(self) -> None:
         """Restart any dead rollout engines and update num_new_engines for update_weights detection.
 
         Recovers the updatable model (the one that receives weight
@@ -214,7 +220,7 @@ class RolloutManager:
         if self.rollout_id == -1 or srv is None:
             return
 
-        srv.recover()
+        await srv.recover()
 
     def _get_updatable_server(self) -> RolloutServer | None:
         updatable = [srv for srv in self.servers.values() if srv.update_weights]
@@ -235,8 +241,8 @@ class RolloutManager:
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
-    def check_weights(self, action: str):
-        return ray.get([engine.check_weights.remote(action=action) for engine in self._rollout_engines])
+    async def check_weights(self, action: str):
+        return await asyncio.gather(*[engine.check_weights.remote(action=action) for engine in self._rollout_engines])
 
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
